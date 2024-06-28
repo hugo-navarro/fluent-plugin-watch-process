@@ -9,7 +9,9 @@ module Fluent::Plugin
     Fluent::Plugin.register_input('watch_process', self)
 
     helpers :timer
-
+    
+    # This default keys, for windows, will be overwritten by the WindowsWatcher class.
+    # Notice that in linux and mac, the data will be gathered straight form the list of processes. Only for windows we have a different approach to associate the services with the processes.
     DEFAULT_KEYS = %w(start_time user pid parent_pid cpu_time cpu_percent memory_percent mem_rss mem_size state proc_name command)
     DEFAULT_TYPES = %w(
       pid:integer
@@ -39,7 +41,7 @@ module Fluent::Plugin
     def configure(conf)
       super
 
-      @windows_watcher = WindowsWatcher.new(@keys, @command, @lookup_user, @powershell_command) if Fluent.windows?
+      @windows_watcher = WindowsWatcher.new(@keys, @command, @powershell_command) if Fluent.windows?
       @keys ||= Fluent.windows? ? @windows_watcher.keys : DEFAULT_KEYS
       @command ||= get_ps_command
       apply_default_types
@@ -66,12 +68,15 @@ module Fluent::Plugin
       begin
         io.gets
         while result = io.gets
+          if result.strip.start_with?("+ CategoryInfo", "ParserError")
+            log.error "watch_process: PowerShell command error - #{result}"
+            next
+          end
+
           if Fluent.windows?
             data = @windows_watcher.parse_line(result)
-            next unless @windows_watcher.match_look_up_user?(data)
           else
-            data = parse_line(result)
-            next unless match_look_up_user?(data)
+            data = Hash[@keys.zip(result.strip.split(/\s+/, @keys.size))]
           end
           emit_tag = tag.dup
           filter_record(emit_tag, Fluent::Engine.now, data)
@@ -82,19 +87,6 @@ module Fluent::Plugin
       end
     rescue StandardError => e
       log.error "watch_process: error has occured. #{e.message}"
-    end
-
-    def parse_line(line)
-      keys_size = @keys.size
-      if line =~ /(?<lstart>(^\w+\s+\w+\s+\d+\s+\d\d:\d\d:\d\d \d+))/
-        lstart = Time.parse($~[:lstart])
-        line = line.sub($~[:lstart], '')
-        keys_size -= 1
-      end
-      values = [lstart.to_s, line.chomp.strip.split(/\s+/, keys_size)]
-      data = Hash[@keys.zip(values.reject(&:empty?).flatten)]
-      data['elapsed_time'] = (Time.now - Time.parse(data['start_time'])).to_i if data['start_time']
-      data
     end
 
     def match_look_up_user?(data)
@@ -120,25 +112,21 @@ module Fluent::Plugin
     class WindowsWatcher
       # Keys are from the "System.Diagnostics.Process" object properties that can be taken by the "Get-Process" command.
       # You can check the all properties by the "(Get-Process)[0] | Get-Member" command.
-      DEFAULT_KEYS = %w(StartTime UserName SessionId Id CPU WorkingSet VirtualMemorySize HandleCount ProcessName)
+      DEFAULT_KEYS = %w(ServiceName DisplayName Status StartType ProcessID ExecutablePath CommandLine CreationDate CPUTime MemoryUsage)
 
       DEFAULT_TYPES = %w(
-        SessionId:integer
-        Id:integer
-        CPU:float
-        WorkingSet:integer
-        VirtualMemorySize:integer
-        HandleCount:integer
+        ProcessID:integer
+        CPUTime:float
+        MemoryUsage:float
       ).join(",")
 
       attr_reader :keys
       attr_reader :command
 
-      def initialize(keys, command, lookup_user, powershell_command)
+      def initialize(keys, command, powershell_command)
         @keys = keys || DEFAULT_KEYS
         @powershell_command = powershell_command
         @command = command || default_command
-        @lookup_user = lookup_user
       end
 
       def default_types
@@ -146,68 +134,60 @@ module Fluent::Plugin
       end
 
       def parse_line(line)
-        values = line.chomp.strip.parse_csv.map { |e| e ? e : "" }
+        values = CSV.parse_line(line.chomp.strip)
+        return {} if values.nil?
+
         data = Hash[@keys.zip(values)]
 
-        unless data["StartTime"].nil?
-          start_time = Time.parse(data['StartTime'])
-          data['ElapsedTime'] = (Time.now - start_time).to_i
-          data["StartTime"] = start_time.to_s
-        end
+        # unless data["CreationDate"].nil?
+        #   creation_date = Time.parse(data['CreationDate'])
+        #   data['ElapsedTime'] = (Time.now - creation_date).to_i
+        #   data["CreationDate"] = creation_date.to_s
+        # end
 
         data
-      end
-
-      def match_look_up_user?(data)
-        return true if @lookup_user.nil?
-
-        @lookup_user.include?(data["UserName"])
       end
 
       def default_command
         command = [
           command_ps,
-          pipe_filtering_normal_ps,
-          pipe_select_columns,
-          pipe_fixing_locale,
-          pipe_formatting_output,
+          pipe_filtering_service,
+          pipe_select_process,
+          pipe_filter_process,
+          pipe_select_process_details,
+          pipe_select_process_null,
+          pipe_formatting_output
         ].join
         "#{@powershell_command} -command \"#{command}\""
       end
 
       def command_ps
-        if @keys.include?("UserName")
-          # The "IncludeUserName" option is needed to get the username, but this option requires Administrator privilege.
-          "Get-Process -IncludeUserName"
-        else
-          "Get-Process"
-        end
+        "Get-Service | Where-Object { $_.Status -eq 'Running' }"
       end
 
-      private
-
-      def pipe_filtering_normal_ps
-        # There are some special processes that don't have some properties, such as the "Idle" process.
-        # Normally, these are specific to the system and are not important, so exclude them.
-        # Note: The same situation can occur in some processes if there are no Administrator privilege.
-        " | ?{$_.StartTime -ne $NULL -and $_.CPU -ne $NULL}"
+      # We are trying to get the services that are running and the processes that are associated with them.
+      def pipe_filtering_service
+        " | ForEach-Object { $service = $_; $processes = Get-Process -Name $service.Name -ErrorAction SilentlyContinue;"
       end
 
-      def pipe_select_columns
-        if @keys.nil? || @keys.empty?
-          raise "The 'keys' parameter is not specified correctly. [keys: #{@keys}]"
-        end
-
-        " | Select-Object -Property #{@keys.join(',')}"
+      def pipe_select_process
+        " if ($processes) { $processes"
       end
 
-      def pipe_fixing_locale()
-        # In Windows, setting the "$env:Lang" environment variable is not effective in changing the format of the output.
-        # You can use "Datetime.ToString" method to change format of datetime values in for-each pipe.
-        # Note: About "DateTime.ToString" method: https://docs.microsoft.com/en-us/dotnet/api/system.datetime.tostring
-        return "" unless @keys.include?("StartTime")
+      def pipe_filter_process
+        " | ForEach-Object { $process = $_; $processDetails = Get-WmiObject -Class Win32_Process -Filter \\\"ProcessId = $($process.Id)\\\" -ErrorAction SilentlyContinue;"
+      end
 
-        " | %{$_.StartTime = $_.StartTime.ToString('o'); return $_;}"
+      # If a process is found, we will get the details of the process. Note that different processes can have different properties that can be added to the output and should be added both in the "DEFAULT_KEYS" and "pipe_select_process_details" variables.
+      # The "CreationDate" property is in the "Win32_Process" class, but it is not in the "System.Diagnostics.Process" class. So, we need to convert it to a readable format.
+      def pipe_select_process_details
+        " if ($processDetails) { [PSCustomObject]@{ \\\"ServiceName\\\" = $service.Name; \\\"DisplayName\\\" = $service.DisplayName; \\\"Status\\\" = $service.Status; \\\"StartType\\\" = $service.StartType; \\\"ProcessID\\\" = $process.Id; \\\"ExecutablePath\\\" = $processDetails.ExecutablePath; \\\"CommandLine\\\" = $processDetails.CommandLine; \\\"CreationDate\\\" = [Management.ManagementDateTimeConverter]::ToDateTime($processDetails.CreationDate).ToString('o'); \\\"CPUTime\\\" = $processDetails.UserModeTime; \\\"MemoryUsage\\\" = [math]::Round($processDetails.WorkingSetSize / 1MB, 2) }"
+      end
+
+      # It is importante to notice that not every service has a process associated with it. Besides that, our user may not have permission to access some services and/or processes.
+      # In these cases, the "Get-Process" and "Get-WmiObject" commands will return null. In this case, we need to return a null object to avoid errors.
+      def pipe_select_process_null
+        " } } } else { [PSCustomObject]@{ \\\"ServiceName\\\" = $service.Name; \\\"DisplayName\\\" = $service.DisplayName; \\\"Status\\\" = $service.Status; \\\"StartType\\\" = $service.StartType; \\\"ProcessID\\\" = \\\"\\\"; \\\"ExecutablePath\\\" = \\\"\\\"; \\\"CommandLine\\\" = \\\"\\\"; \\\"CreationDate\\\" = \\\"\\\"; \\\"CPUTime\\\" = \\\"\\\"; \\\"MemoryUsage\\\" = \\\"\\\" } } }"
       end
 
       def pipe_formatting_output
